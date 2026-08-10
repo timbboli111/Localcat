@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +15,8 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
+	"localcat/internal/history"
+	"localcat/internal/identity"
 	"localcat/internal/network"
 )
 
@@ -26,6 +30,20 @@ func main() {
 	window := application.NewWindow("LocalCat")
 	window.Resize(fyne.NewSize(520, 640))
 
+	ident, err := identity.Load(application.Preferences())
+	if err != nil {
+		dialog.ShowError(err, window)
+		window.ShowAndRun()
+		return
+	}
+	storePath := filepath.Join(application.Storage().RootURI().Path(), "history.json")
+	historyStore, err := history.Open(storePath)
+	if err != nil {
+		dialog.ShowError(err, window)
+		window.ShowAndRun()
+		return
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -36,25 +54,48 @@ func main() {
 		return
 	}
 
-	selfName := network.DefaultName()
-	selfID := network.NewID()
-	store := &peerStore{peers: make(map[string]network.Peer)}
+	peers := &peerStore{peers: make(map[string]network.Peer)}
+	var selectedPeer network.Peer
 
-	messages := widget.NewMultiLineEntry()
-	messages.SetPlaceHolder("Pesan LAN akan muncul di sini...")
-	messages.Wrapping = fyne.TextWrapWord
-	onMessage := func(line string) {
-		messages.SetText(messages.Text + line + "\n")
+	messageLabel := widget.NewLabel("Pesan LAN akan muncul di sini...")
+	messageLabel.Wrapping = fyne.TextWrapWord
+	messageScroll := container.NewVScroll(messageLabel)
+
+	renderConversation := func(peer network.Peer) {
+		msgs := historyStore.Messages(history.DirectID(peer.ID))
+		if len(msgs) == 0 {
+			messageLabel.SetText("Belum ada pesan dengan " + peer.Name + ".")
+			return
+		}
+		var b strings.Builder
+		for _, msg := range msgs {
+			name := msg.SenderName
+			if msg.Outgoing {
+				name = "Saya → " + peer.Name
+			}
+			b.WriteString(fmt.Sprintf("%s: %s\n", name, msg.Text))
+		}
+		messageLabel.SetText(b.String())
+		messageScroll.ScrollToBottom()
+	}
+	appendStoredMessage := func(peer network.Peer, msg history.Message) {
+		conv := history.Conversation{ID: history.DirectID(peer.ID), Type: history.DirectConversation, Title: peer.Name, Participant: peer.ID}
+		if err := historyStore.AddMessage(conv, msg); err != nil {
+			dialog.ShowError(err, window)
+			return
+		}
+		if selectedPeer.ID == peer.ID {
+			renderConversation(peer)
+		}
 	}
 
-	peerNames := []string{}
-	var selectedPeer network.Peer
-	peerSelect := widget.NewSelect(peerNames, func(name string) {
-		store.mu.Lock()
-		defer store.mu.Unlock()
-		for _, peer := range store.peers {
+	peerSelect := widget.NewSelect(nil, func(name string) {
+		peers.mu.Lock()
+		defer peers.mu.Unlock()
+		for _, peer := range peers.peers {
 			if displayName(peer) == name {
 				selectedPeer = peer
+				renderConversation(peer)
 				return
 			}
 		}
@@ -64,29 +105,83 @@ func main() {
 	input := widget.NewEntry()
 	input.SetPlaceHolder("Ketik pesan...")
 	sendButton := widget.NewButton("Kirim", func() {
-		text := input.Text
+		text := strings.TrimSpace(input.Text)
 		if text == "" || selectedPeer.ID == "" {
 			return
 		}
-		msg := network.Message{From: selfName, Text: text, Time: time.Now()}
-		go func(peer network.Peer) {
+		msg := network.Message{From: ident.DisplayName, FromID: ident.ID, Text: text, Time: time.Now()}
+		peer := selectedPeer
+		go func() {
 			if err := network.SendMessage(peer, msg); err != nil {
 				fyne.Do(func() { dialog.ShowError(err, window) })
 				return
 			}
-			fyne.Do(func() { onMessage(fmt.Sprintf("Saya → %s: %s", peer.Name, text)) })
-		}(selectedPeer)
+			fyne.Do(func() {
+				appendStoredMessage(peer, history.Message{SenderID: ident.ID, SenderName: ident.DisplayName, Text: text, SentAt: msg.Time, Outgoing: true})
+			})
+		}()
 		input.SetText("")
 	})
 
-	status := widget.NewLabel(fmt.Sprintf("Nama: %s • TCP:%d • Discovery UDP multicast aktif", selfName, server.Port()))
-	content := container.NewBorder(
-		container.NewVBox(widget.NewLabel("Pilih peer LocalCat di LAN:"), peerSelect, status),
-		container.NewBorder(nil, nil, nil, sendButton, input),
-		nil,
-		nil,
-		messages,
-	)
+	status := widget.NewLabel("")
+	refreshStatus := func() {
+		status.SetText(fmt.Sprintf("Nama: %s • ID:%s • TCP:%d • Discovery UDP multicast aktif", ident.DisplayName, ident.ID[:8], server.Port()))
+	}
+	refreshStatus()
+
+	discovery := network.NewDiscovery(ident.ID, ident.DisplayName, server.Port())
+	var showNameDialog func(first bool)
+	showNameDialog = func(first bool) {
+		entry := widget.NewEntry()
+		entry.SetText(ident.DisplayName)
+		entry.SetPlaceHolder("Nama tampilan")
+		d := dialog.NewCustomConfirm("Nama tampilan", "Simpan", "Batal", entry, func(ok bool) {
+			if !ok && !first {
+				return
+			}
+			name := strings.TrimSpace(entry.Text)
+			if err := identity.SaveDisplayName(application.Preferences(), name); err != nil {
+				dialog.ShowError(err, window)
+				if first {
+					showNameDialog(true)
+				}
+				return
+			}
+			ident.DisplayName = name
+			discovery.UpdateName(name)
+			refreshStatus()
+		}, window)
+		d.Show()
+	}
+	if ident.DisplayName == "" {
+		showNameDialog(true)
+	}
+
+	deleteConversation := func() {
+		if selectedPeer.ID != "" {
+			dialog.ShowConfirm("Hapus percakapan", "Hapus riwayat lokal dengan "+selectedPeer.Name+"? Riwayat di perangkat lain tidak terpengaruh.", func(ok bool) {
+				if ok {
+					_ = historyStore.DeleteConversation(history.DirectID(selectedPeer.ID))
+					renderConversation(selectedPeer)
+				}
+			}, window)
+		}
+	}
+	deleteAll := func() {
+		dialog.ShowConfirm("Hapus semua riwayat", "Hapus semua riwayat chat lokal di perangkat ini?", func(ok bool) {
+			if ok {
+				_ = historyStore.DeleteAll()
+				if selectedPeer.ID != "" {
+					renderConversation(selectedPeer)
+				} else {
+					messageLabel.SetText("Pesan LAN akan muncul di sini...")
+				}
+			}
+		}, window)
+	}
+	window.SetMainMenu(fyne.NewMainMenu(fyne.NewMenu("Settings", fyne.NewMenuItem("Change display name", func() { showNameDialog(false) }), fyne.NewMenuItem("Delete conversation", deleteConversation), fyne.NewMenuItem("Delete all history", deleteAll))))
+
+	content := container.NewBorder(container.NewVBox(widget.NewLabel("Pilih peer LocalCat di LAN:"), peerSelect, status), container.NewBorder(nil, nil, nil, sendButton, input), nil, nil, messageScroll)
 	window.SetContent(content)
 
 	go func() {
@@ -97,15 +192,18 @@ func main() {
 	go func() {
 		for msg := range server.Incoming() {
 			message := msg
-			fyne.Do(func() { onMessage(fmt.Sprintf("%s: %s", message.From, message.Text)) })
+			fyne.Do(func() {
+				peer := network.Peer{ID: message.FromID, Name: message.From}
+				if peer.ID == "" {
+					peer.ID = message.From
+				}
+				appendStoredMessage(peer, history.Message{SenderID: peer.ID, SenderName: message.From, Text: message.Text, SentAt: message.Time})
+			})
 		}
 	}()
-	go runDiscovery(ctx, network.NewDiscovery(selfID, selfName, server.Port()), store, peerSelect, &selectedPeer)
+	go runDiscovery(ctx, discovery, peers, peerSelect, &selectedPeer)
 
-	window.SetCloseIntercept(func() {
-		cancel()
-		window.Close()
-	})
+	window.SetCloseIntercept(func() { cancel(); window.Close() })
 	window.ShowAndRun()
 }
 

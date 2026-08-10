@@ -1,0 +1,6 @@
+Website = "https://localcat.local"
+Details = "Chat lokal LAN dengan auto-discovery UDP multicast dan pesan TCP."
+Icon = ""
+
+[Release]
+Build = 1

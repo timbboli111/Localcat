@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"sync"
 	"time"
 )
@@ -34,6 +33,7 @@ type announcement struct {
 
 // Discovery sends and receives UDP multicast announcements.
 type Discovery struct {
+	mu     sync.RWMutex
 	selfID string
 	name   string
 	port   int
@@ -45,6 +45,12 @@ func NewDiscovery(selfID, name string, port int) *Discovery {
 }
 
 func (d *Discovery) Peers() <-chan Peer { return d.peers }
+
+func (d *Discovery) UpdateName(name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.name = name
+}
 
 func (d *Discovery) Run(ctx context.Context) error {
 	addr, err := net.ResolveUDPAddr("udp4", multicastAddress)
@@ -122,17 +128,11 @@ func (d *Discovery) sendAnnouncement(addr *net.UDPAddr) {
 		return
 	}
 	defer conn.Close()
+	d.mu.RLock()
 	payload, err := json.Marshal(announcement{App: "LocalCat", ID: d.selfID, Name: d.name, Port: d.port})
+	d.mu.RUnlock()
 	if err != nil {
 		return
 	}
 	_, _ = conn.Write(payload)
-}
-
-func DefaultName() string {
-	host, err := os.Hostname()
-	if err != nil || host == "" {
-		return "LocalCat"
-	}
-	return host
 }

@@ -11,9 +11,10 @@ import (
 
 // Message is the JSON payload exchanged over TCP between LocalCat peers.
 type Message struct {
-	From string    `json:"from"`
-	Text string    `json:"text"`
-	Time time.Time `json:"time"`
+	From   string    `json:"from"`
+	FromID string    `json:"from_id,omitempty"`
+	Text   string    `json:"text"`
+	Time   time.Time `json:"time"`
 }
 
 // WriteMessage writes a single newline-delimited JSON message.

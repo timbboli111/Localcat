@@ -105,7 +105,8 @@ func main() {
 
 	input := widget.NewEntry()
 	input.SetPlaceHolder("Ketik pesan...")
-	sendButton := widget.NewButton("Kirim", func() {
+
+	sendMessage := func() {
 		text := strings.TrimSpace(input.Text)
 		if text == "" || selectedPeer.ID == "" {
 			return
@@ -122,6 +123,14 @@ func main() {
 			})
 		}()
 		input.SetText("")
+	}
+
+	input.OnSubmitted = func(_ string) {
+		sendMessage()
+	}
+
+	sendButton := widget.NewButton("Kirim", func() {
+		sendMessage()
 	})
 
 	status := widget.NewLabel("")

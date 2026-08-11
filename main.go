@@ -13,6 +13,7 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"localcat/internal/history"
@@ -130,6 +131,11 @@ func main() {
 	refreshStatus()
 
 	discovery := network.NewDiscovery(ident.ID, ident.DisplayName, server.Port())
+
+	refreshButton := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
+		discovery.Refresh()
+	})
+
 	var showNameDialog func(first bool)
 	showNameDialog = func(first bool) {
 		entry := widget.NewEntry()
@@ -181,7 +187,14 @@ func main() {
 	}
 	window.SetMainMenu(fyne.NewMainMenu(fyne.NewMenu("Settings", fyne.NewMenuItem("Change display name", func() { showNameDialog(false) }), fyne.NewMenuItem("Delete conversation", deleteConversation), fyne.NewMenuItem("Delete all history", deleteAll))))
 
-	content := container.NewBorder(container.NewVBox(widget.NewLabel("Pilih peer LocalCat di LAN:"), peerSelect, status), container.NewBorder(nil, nil, nil, sendButton, input), nil, nil, messageScroll)
+	header := container.NewBorder(nil, nil, nil, refreshButton,
+		container.NewVBox(
+			widget.NewLabel("Pilih peer LocalCat di LAN:"),
+			peerSelect,
+			status,
+		))
+
+	content := container.NewBorder(header, container.NewBorder(nil, nil, nil, sendButton, input), nil, nil, messageScroll)
 	window.SetContent(content)
 
 	go func() {

@@ -33,15 +33,22 @@ type announcement struct {
 
 // Discovery sends and receives UDP multicast announcements.
 type Discovery struct {
-	mu     sync.RWMutex
-	selfID string
-	name   string
-	port   int
-	peers  chan Peer
+	mu        sync.RWMutex
+	selfID    string
+	name      string
+	port      int
+	peers     chan Peer
+	refreshCh chan struct{}
 }
 
 func NewDiscovery(selfID, name string, port int) *Discovery {
-	return &Discovery{selfID: selfID, name: name, port: port, peers: make(chan Peer, 32)}
+	return &Discovery{
+		selfID:    selfID,
+		name:      name,
+		port:      port,
+		peers:     make(chan Peer, 32),
+		refreshCh: make(chan struct{}, 1),
+	}
 }
 
 func (d *Discovery) Peers() <-chan Peer { return d.peers }
@@ -50,6 +57,15 @@ func (d *Discovery) UpdateName(name string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.name = name
+}
+
+// Refresh triggers an additional announcement using the same Discovery instance.
+// If a refresh is already pending, subsequent calls are ignored.
+func (d *Discovery) Refresh() {
+	select {
+	case d.refreshCh <- struct{}{}:
+	default:
+	}
 }
 
 func (d *Discovery) Run(ctx context.Context) error {
@@ -66,10 +82,14 @@ func (d *Discovery) Run(ctx context.Context) error {
 	_ = conn.SetReadBuffer(8192)
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		d.readLoop(ctx, conn)
+	}()
+	go func() {
+		defer wg.Done()
+		d.refreshLoop(ctx, addr)
 	}()
 	go func() {
 		defer wg.Done()
@@ -79,6 +99,17 @@ func (d *Discovery) Run(ctx context.Context) error {
 	_ = conn.SetReadDeadline(time.Now())
 	wg.Wait()
 	return nil
+}
+
+func (d *Discovery) refreshLoop(ctx context.Context, addr *net.UDPAddr) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-d.refreshCh:
+			d.sendAnnouncement(addr)
+		}
+	}
 }
 
 func (d *Discovery) readLoop(ctx context.Context, conn *net.UDPConn) {

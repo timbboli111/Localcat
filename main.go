@@ -123,6 +123,7 @@ func main() {
 			})
 		}()
 		input.SetText("")
+		window.Canvas().Focus(input)
 	}
 
 	input.OnSubmitted = func(_ string) {

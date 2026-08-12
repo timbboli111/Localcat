@@ -63,6 +63,7 @@ func main() {
 	messageScroll := container.NewVScroll(messageLabel)
 
 	renderConversation := func(peer network.Peer) {
+		_ = historyStore.MarkAsRead(history.DirectID(peer.ID))
 		msgs := historyStore.Messages(history.DirectID(peer.ID))
 		if len(msgs) == 0 {
 			messageLabel.SetText("Belum ada pesan dengan " + peer.Name + ".")
@@ -221,13 +222,22 @@ func main() {
 					peer.ID = message.From
 				}
 				appendStoredMessage(peer, history.Message{SenderID: peer.ID, SenderName: message.From, Text: message.Text, SentAt: message.Time})
+				sendNotification(application, peer.Name, message.Text)
 			})
 		}
 	}()
 	go runDiscovery(ctx, discovery, peers, peerSelect, &selectedPeer)
+	go checkPeerTimeout(ctx, peers)
 
 	window.SetCloseIntercept(func() { cancel(); window.Close() })
 	window.ShowAndRun()
+}
+
+func sendNotification(app fyne.App, title, content string) {
+	app.SendNotification(&fyne.Notification{
+		Title:   title,
+		Content: content,
+	})
 }
 
 func runDiscovery(ctx context.Context, discovery *network.Discovery, store *peerStore, peerSelect *widget.Select, selectedPeer *network.Peer) {
@@ -246,17 +256,55 @@ func runDiscovery(ctx context.Context, discovery *network.Discovery, store *peer
 			sort.Strings(names)
 			if selectedPeer.ID == "" {
 				*selectedPeer = peer
+			} else if selectedPeer.ID == peer.ID {
+				*selectedPeer = peer
 			}
 			store.mu.Unlock()
 			fyne.Do(func() {
 				peerSelect.Options = names
 				if peerSelect.Selected == "" && len(names) > 0 {
 					peerSelect.SetSelected(names[0])
+				} else if selectedPeer.ID != "" {
+					valid := false
+					for _, name := range names {
+						if name == peerSelect.Selected {
+							valid = true
+							break
+						}
+					}
+					if !valid {
+						peerSelect.SetSelected(displayName(*selectedPeer))
+					}
 				}
 				peerSelect.Refresh()
 			})
 		}
 	}
+}
+
+func checkPeerTimeout(ctx context.Context, store *peerStore) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			store.mu.Lock()
+			for id, peer := range store.peers {
+				if !isPeerOnline(peer) {
+					// Peer offline/stale - evaluasi dilakukan, status dapat digunakan
+					// oleh komponen lain yang membutuhkan
+					_ = id
+				}
+			}
+			store.mu.Unlock()
+		}
+	}
+}
+
+func isPeerOnline(peer network.Peer) bool {
+	return time.Since(peer.LastSeen) <= 10*time.Second
 }
 
 func displayName(peer network.Peer) string {

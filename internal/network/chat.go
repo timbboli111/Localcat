@@ -81,5 +81,6 @@ func SendMessage(peer Peer, msg Message) error {
 		return fmt.Errorf("connect to %s: %w", address, err)
 	}
 	defer conn.Close()
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	return WriteMessage(conn, msg)
 }

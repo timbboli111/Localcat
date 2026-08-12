@@ -19,6 +19,7 @@ type Conversation struct {
 	Title       string    `json:"title"`
 	Participant string    `json:"participant,omitempty"`
 	UpdatedAt   time.Time `json:"updated_at"`
+	UnreadCount int       `json:"unread_count,omitempty"`
 }
 
 type Message struct {
@@ -85,6 +86,9 @@ func (s *Store) AddMessage(conv Conversation, msg Message) error {
 	}
 	msg.ConversationID = conv.ID
 	conv.UpdatedAt = msg.SentAt
+	if !msg.Outgoing {
+		conv.UnreadCount++
+	}
 	s.data.Conversations[conv.ID] = conv
 	s.data.Messages = append(s.data.Messages, msg)
 	return s.saveLocked()
@@ -112,6 +116,18 @@ func (s *Store) Conversations() []Conversation {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
 	return out
+}
+
+func (s *Store) MarkAsRead(conversationID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	conv, exists := s.data.Conversations[conversationID]
+	if !exists || conv.UnreadCount == 0 {
+		return nil
+	}
+	conv.UnreadCount = 0
+	s.data.Conversations[conversationID] = conv
+	return s.saveLocked()
 }
 
 func (s *Store) DeleteConversation(id string) error {

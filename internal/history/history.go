@@ -85,6 +85,14 @@ func (s *Store) AddMessage(conv Conversation, msg Message) error {
 		msg.ID = fmt.Sprintf("%d", msg.SentAt.UnixNano())
 	}
 	msg.ConversationID = conv.ID
+
+	// Preserve existing unread count if conversation already exists.
+	// Callers may pass a fresh Conversation with UnreadCount 0, which
+	// would otherwise reset the counter before incrementing.
+	if existingConv, exists := s.data.Conversations[conv.ID]; exists {
+		conv.UnreadCount = existingConv.UnreadCount
+	}
+
 	conv.UpdatedAt = msg.SentAt
 	if !msg.Outgoing {
 		conv.UnreadCount++

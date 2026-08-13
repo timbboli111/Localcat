@@ -8,6 +8,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"localcat/internal/group"
 )
 
 const (
@@ -22,13 +24,15 @@ type Peer struct {
 	Address  string
 	Port     int
 	LastSeen time.Time
+	Groups   []group.GroupAdvertisement
 }
 
 type announcement struct {
-	App  string `json:"app"`
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Port int    `json:"port"`
+	App    string                     `json:"app"`
+	ID     string                     `json:"id"`
+	Name   string                     `json:"name"`
+	Port   int                        `json:"port"`
+	Groups []group.GroupAdvertisement `json:"groups,omitempty"`
 }
 
 // Discovery sends and receives UDP multicast announcements.
@@ -37,6 +41,7 @@ type Discovery struct {
 	selfID    string
 	name      string
 	port      int
+	groups    []group.GroupAdvertisement
 	peers     chan Peer
 	refreshCh chan struct{}
 }
@@ -57,6 +62,14 @@ func (d *Discovery) UpdateName(name string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.name = name
+}
+
+// SetGroups replaces the advertised group metadata for this peer.
+// An empty or nil slice removes group advertisements.
+func (d *Discovery) SetGroups(groups []group.GroupAdvertisement) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.groups = append([]group.GroupAdvertisement(nil), groups...)
 }
 
 // Refresh triggers an additional announcement using the same Discovery instance.
@@ -113,7 +126,7 @@ func (d *Discovery) refreshLoop(ctx context.Context, addr *net.UDPAddr) {
 }
 
 func (d *Discovery) readLoop(ctx context.Context, conn *net.UDPConn) {
-	buf := make([]byte, 2048)
+	buf := make([]byte, 4096)
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		n, remote, err := conn.ReadFromUDP(buf)
@@ -132,8 +145,21 @@ func (d *Discovery) readLoop(ctx context.Context, conn *net.UDPConn) {
 		if err := json.Unmarshal(buf[:n], &ann); err != nil || ann.App != "LocalCat" || ann.ID == d.selfID || ann.Port == 0 {
 			continue
 		}
+
+		peer := Peer{
+			ID:       ann.ID,
+			Name:     ann.Name,
+			Address:  remote.IP.String(),
+			Port:     ann.Port,
+			LastSeen: time.Now(),
+			Groups:   ann.Groups,
+		}
+		if peer.Groups == nil {
+			peer.Groups = []group.GroupAdvertisement{}
+		}
+
 		select {
-		case d.peers <- Peer{ID: ann.ID, Name: ann.Name, Address: remote.IP.String(), Port: ann.Port, LastSeen: time.Now()}:
+		case d.peers <- peer:
 		default:
 		}
 	}
@@ -159,9 +185,18 @@ func (d *Discovery) sendAnnouncement(addr *net.UDPAddr) {
 		return
 	}
 	defer conn.Close()
+
 	d.mu.RLock()
-	payload, err := json.Marshal(announcement{App: "LocalCat", ID: d.selfID, Name: d.name, Port: d.port})
+	ann := announcement{
+		App:    "LocalCat",
+		ID:     d.selfID,
+		Name:   d.name,
+		Port:   d.port,
+		Groups: d.groups,
+	}
 	d.mu.RUnlock()
+
+	payload, err := json.Marshal(ann)
 	if err != nil {
 		return
 	}

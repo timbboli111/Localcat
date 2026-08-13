@@ -2,8 +2,16 @@ package group
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
+
+	"localcat/internal/history"
 )
+
+func newTestStore(t *testing.T) (*history.Store, error) {
+	t.Helper()
+	return history.Open(filepath.Join(t.TempDir(), "history.json"))
+}
 
 func TestGroupAdvertisementFormat(t *testing.T) {
 	ad := GroupAdvertisement{

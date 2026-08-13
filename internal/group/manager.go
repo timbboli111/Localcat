@@ -147,7 +147,6 @@ func (m *Manager) AcceptJoinRequest(groupID, requesterID, actingHostID string) e
 		return fmt.Errorf("request for %q is not pending", requesterID)
 	}
 
-	// Add as member
 	if err := g.AddMember(requesterID, pending.RequesterName); err != nil {
 		return err
 	}
@@ -177,6 +176,25 @@ func (m *Manager) RejectJoinRequest(groupID, requesterID, actingHostID string) e
 	}
 	pr.Remove(requesterID)
 	return nil
+}
+
+// LeaveGroup allows a non-host member to leave a group.
+// The Host cannot leave; they must Close the group instead.
+func (m *Manager) LeaveGroup(groupID, memberID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	g, exists := m.groups[groupID]
+	if !exists {
+		return ErrGroupNotFound
+	}
+	if memberID == g.HostID {
+		return fmt.Errorf("host cannot leave, use CloseGroup instead")
+	}
+	if !g.HasMember(memberID) {
+		return fmt.Errorf("member %q not in group %q", memberID, groupID)
+	}
+	return g.RemoveMember(memberID)
 }
 
 // IsHost checks if the given identity ID is the host of the given group.

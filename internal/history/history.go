@@ -11,7 +11,10 @@ import (
 	"time"
 )
 
-const DirectConversation = "direct"
+const (
+	DirectConversation = "direct"
+	GroupConversation  = "group"
+)
 
 type Conversation struct {
 	ID          string    `json:"id"`
@@ -24,6 +27,7 @@ type Conversation struct {
 
 type Message struct {
 	ID             string    `json:"id"`
+	MessageID      string    `json:"message_id,omitempty"`
 	ConversationID string    `json:"conversation_id"`
 	SenderID       string    `json:"sender_id"`
 	SenderName     string    `json:"sender_name"`
@@ -69,6 +73,9 @@ func Open(path string) (*Store, error) {
 
 func DirectID(peerID string) string { return DirectConversation + ":" + peerID }
 
+// GroupID returns the conversation ID for a group chat.
+func GroupID(groupID string) string { return GroupConversation + ":" + groupID }
+
 func (s *Store) AddMessage(conv Conversation, msg Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -100,6 +107,22 @@ func (s *Store) AddMessage(conv Conversation, msg Message) error {
 	s.data.Conversations[conv.ID] = conv
 	s.data.Messages = append(s.data.Messages, msg)
 	return s.saveLocked()
+}
+
+// HasMessageID checks whether a message with the given MessageID
+// already exists in any conversation. Used for duplicate prevention.
+func (s *Store) HasMessageID(messageID string) bool {
+	if messageID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.data.Messages {
+		if m.MessageID == messageID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) Messages(conversationID string) []Message {

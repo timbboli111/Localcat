@@ -74,11 +74,24 @@ func (s *ChatServer) handleConnection(conn net.Conn) {
 	}
 }
 
+// SendMessage sends a message to a specific peer.
 func SendMessage(peer Peer, msg Message) error {
 	address := net.JoinHostPort(peer.Address, strconv.Itoa(peer.Port))
 	conn, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("connect to %s: %w", address, err)
+	}
+	defer conn.Close()
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return WriteMessage(conn, msg)
+}
+
+// SendToAddress sends a message to a specific address:port.
+func SendToAddress(address string, port int, msg Message) error {
+	addr := net.JoinHostPort(address, strconv.Itoa(port))
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("connect to %s: %w", addr, err)
 	}
 	defer conn.Close()
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))

@@ -44,6 +44,8 @@ type Discovery struct {
 	groups    []group.GroupAdvertisement
 	peers     chan Peer
 	refreshCh chan struct{}
+	iface     *net.Interface
+	localAddr *net.UDPAddr
 }
 
 func NewDiscovery(selfID, name string, port int) *Discovery {
@@ -51,7 +53,7 @@ func NewDiscovery(selfID, name string, port int) *Discovery {
 		selfID:    selfID,
 		name:      name,
 		port:      port,
-		peers:     make(chan Peer, 32),
+		peers:     make(chan Peer, 64),
 		refreshCh: make(chan struct{}, 1),
 	}
 }
@@ -64,16 +66,12 @@ func (d *Discovery) UpdateName(name string) {
 	d.name = name
 }
 
-// SetGroups replaces the advertised group metadata for this peer.
-// An empty or nil slice removes group advertisements.
 func (d *Discovery) SetGroups(groups []group.GroupAdvertisement) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.groups = append([]group.GroupAdvertisement(nil), groups...)
 }
 
-// Refresh triggers an additional announcement using the same Discovery instance.
-// If a refresh is already pending, subsequent calls are ignored.
 func (d *Discovery) Refresh() {
 	select {
 	case d.refreshCh <- struct{}{}:
@@ -81,13 +79,83 @@ func (d *Discovery) Refresh() {
 	}
 }
 
+// selectInterface finds an active IPv4 interface with a private LAN address.
+func selectInterface() (*net.Interface, *net.UDPAddr, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, nil, fmt.Errorf("list interfaces: %w", err)
+	}
+
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if iface.Flags&net.FlagMulticast == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil {
+				continue
+			}
+			if !isPrivateIPv4(ip4) {
+				continue
+			}
+
+			localAddr := &net.UDPAddr{IP: ip4, Port: 0}
+			fmt.Printf("[DISCOVERY] interface: %s\n", iface.Name)
+			fmt.Printf("[DISCOVERY] IPv4: %s\n", ip4.String())
+
+			ifaceCopy := iface
+			return &ifaceCopy, localAddr, nil
+		}
+	}
+
+	return nil, nil, fmt.Errorf("no suitable IPv4 LAN interface found")
+}
+
+func isPrivateIPv4(ip net.IP) bool {
+	if ip[0] == 10 {
+		return true
+	}
+	if ip[0] == 192 && ip[1] == 168 {
+		return true
+	}
+	if ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31 {
+		return true
+	}
+	return false
+}
+
 func (d *Discovery) Run(ctx context.Context) error {
+	iface, localAddr, err := selectInterface()
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.iface = iface
+	d.localAddr = localAddr
+	d.mu.Unlock()
+
 	addr, err := net.ResolveUDPAddr("udp4", multicastAddress)
 	if err != nil {
 		return fmt.Errorf("resolve multicast address: %w", err)
 	}
 
-	conn, err := net.ListenMulticastUDP("udp4", nil, addr)
+	conn, err := net.ListenMulticastUDP("udp4", iface, addr)
 	if err != nil {
 		return fmt.Errorf("listen multicast: %w", err)
 	}
@@ -180,7 +248,15 @@ func (d *Discovery) announceLoop(ctx context.Context, addr *net.UDPAddr) {
 }
 
 func (d *Discovery) sendAnnouncement(addr *net.UDPAddr) {
-	conn, err := net.DialUDP("udp4", nil, addr)
+	d.mu.RLock()
+	localAddr := d.localAddr
+	d.mu.RUnlock()
+
+	if localAddr == nil {
+		return
+	}
+
+	conn, err := net.DialUDP("udp4", localAddr, addr)
 	if err != nil {
 		return
 	}

@@ -12,7 +12,7 @@ import (
 // Message is the JSON payload exchanged over TCP between LocalCat peers.
 // The Type field distinguishes direct chat from group chat and control messages.
 type Message struct {
-	Type   string    `json:"type,omitempty"`    // "direct" (default) or "group"
+	Type   string    `json:"type,omitempty"`    // "direct" (default), "group", "join_request", "join_accept", "join_reject"
 	From   string    `json:"from"`              // Display name of sender
 	FromID string    `json:"from_id,omitempty"` // Identity ID of sender
 	Text   string    `json:"text"`              // Direct chat message body
@@ -24,6 +24,11 @@ type Message struct {
 	SenderID   string `json:"sender_id,omitempty"`
 	SenderName string `json:"sender_name,omitempty"`
 	Body       string `json:"body,omitempty"`
+
+	// Join request/response fields
+	RequesterID   string `json:"requester_id,omitempty"`
+	RequesterName string `json:"requester_name,omitempty"`
+	Reason        string `json:"reason,omitempty"`
 }
 
 // WriteMessage writes a single newline-delimited JSON message.
@@ -52,6 +57,27 @@ func WriteMessage(w io.Writer, msg Message) error {
 		}
 		if msg.Body == "" {
 			return fmt.Errorf("message body is required")
+		}
+	case "join_request":
+		if msg.RequesterID == "" {
+			return fmt.Errorf("requester id is required")
+		}
+		if msg.GroupID == "" {
+			return fmt.Errorf("group id is required")
+		}
+	case "join_accept":
+		if msg.GroupID == "" {
+			return fmt.Errorf("group id is required")
+		}
+		if msg.RequesterID == "" {
+			return fmt.Errorf("requester id is required")
+		}
+	case "join_reject":
+		if msg.GroupID == "" {
+			return fmt.Errorf("group id is required")
+		}
+		if msg.RequesterID == "" {
+			return fmt.Errorf("requester id is required")
 		}
 	default:
 		return fmt.Errorf("unknown message type: %q", msg.Type)

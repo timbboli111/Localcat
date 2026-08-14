@@ -81,17 +81,14 @@ func TestGroupMessageRoundTrip(t *testing.T) {
 func TestWriteMessageValidatesGroupFields(t *testing.T) {
 	var buf bytes.Buffer
 
-	// Missing sender id
 	if err := WriteMessage(&buf, Message{Type: "group", GroupID: "g", Body: "hello"}); err == nil {
 		t.Fatal("WriteMessage() group with empty sender id succeeded")
 	}
 
-	// Missing group id
 	if err := WriteMessage(&buf, Message{Type: "group", SenderID: "s", Body: "hello"}); err == nil {
 		t.Fatal("WriteMessage() group with empty group id succeeded")
 	}
 
-	// Missing body
 	if err := WriteMessage(&buf, Message{Type: "group", SenderID: "s", GroupID: "g", Body: "   "}); err == nil {
 		t.Fatal("WriteMessage() group with empty body succeeded")
 	}
@@ -101,5 +98,95 @@ func TestWriteMessageUnknownType(t *testing.T) {
 	var buf bytes.Buffer
 	if err := WriteMessage(&buf, Message{Type: "unknown", From: "Alice", Text: "hello"}); err == nil {
 		t.Fatal("WriteMessage() with unknown type succeeded")
+	}
+}
+
+func TestJoinRequestMessageRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	wantTime := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	want := Message{
+		Type:          "join_request",
+		GroupID:       "group-123",
+		RequesterID:   "requester-1",
+		RequesterName: "Requester One",
+		Time:          wantTime,
+	}
+	if err := WriteMessage(&buf, want); err != nil {
+		t.Fatalf("WriteMessage() join_request error = %v", err)
+	}
+	got, err := ReadMessage(bufio.NewReader(&buf))
+	if err != nil {
+		t.Fatalf("ReadMessage() join_request error = %v", err)
+	}
+	if got.Type != "join_request" {
+		t.Fatalf("Type = %q, want join_request", got.Type)
+	}
+	if got.GroupID != "group-123" {
+		t.Fatalf("GroupID = %q, want group-123", got.GroupID)
+	}
+	if got.RequesterID != "requester-1" {
+		t.Fatalf("RequesterID = %q, want requester-1", got.RequesterID)
+	}
+	if got.RequesterName != "Requester One" {
+		t.Fatalf("RequesterName = %q, want Requester One", got.RequesterName)
+	}
+	if !got.Time.Equal(wantTime) {
+		t.Fatalf("Time = %v, want %v", got.Time, wantTime)
+	}
+}
+
+func TestWriteMessageValidatesJoinRequestFields(t *testing.T) {
+	var buf bytes.Buffer
+
+	if err := WriteMessage(&buf, Message{Type: "join_request", GroupID: "g"}); err == nil {
+		t.Fatal("WriteMessage() join_request with empty requester id succeeded")
+	}
+
+	if err := WriteMessage(&buf, Message{Type: "join_request", RequesterID: "r"}); err == nil {
+		t.Fatal("WriteMessage() join_request with empty group id succeeded")
+	}
+}
+
+func TestJoinAcceptMessageRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	want := Message{
+		Type:        "join_accept",
+		GroupID:     "group-123",
+		RequesterID: "requester-1",
+		Time:        time.Now(),
+	}
+	if err := WriteMessage(&buf, want); err != nil {
+		t.Fatalf("WriteMessage() join_accept error = %v", err)
+	}
+	got, err := ReadMessage(bufio.NewReader(&buf))
+	if err != nil {
+		t.Fatalf("ReadMessage() join_accept error = %v", err)
+	}
+	if got.Type != "join_accept" {
+		t.Fatalf("Type = %q, want join_accept", got.Type)
+	}
+}
+
+func TestJoinRejectMessageRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	want := Message{
+		Type:        "join_reject",
+		GroupID:     "group-123",
+		RequesterID: "requester-1",
+		Reason:      "Not approved",
+		Time:        time.Now(),
+	}
+	if err := WriteMessage(&buf, want); err != nil {
+		t.Fatalf("WriteMessage() join_reject error = %v", err)
+	}
+	got, err := ReadMessage(bufio.NewReader(&buf))
+	if err != nil {
+		t.Fatalf("ReadMessage() join_reject error = %v", err)
+	}
+	if got.Type != "join_reject" {
+		t.Fatalf("Type = %q, want join_reject", got.Type)
+	}
+	if got.Reason != "Not approved" {
+		t.Fatalf("Reason = %q, want Not approved", got.Reason)
 	}
 }

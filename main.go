@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"image/color"
+	"net"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -19,12 +20,13 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"localcat/internal/group"
 	"localcat/internal/history"
 	"localcat/internal/identity"
 	"localcat/internal/network"
 )
 
-const appVersion = "v1.2.0"
+const appVersion = "v1.3.6"
 
 var (
 	colorPrimary      = color.NRGBA{R: 0x1E, G: 0x88, B: 0xE5, A: 0xFF}
@@ -37,6 +39,7 @@ var (
 	colorTextSub      = color.NRGBA{R: 0x75, G: 0x75, B: 0x75, A: 0xFF}
 	colorTextWhite    = color.NRGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: 0xFF}
 	colorSelectedBg   = color.NRGBA{R: 0xE3, G: 0xF2, B: 0xFD, A: 0xFF}
+	colorGroupBg      = color.NRGBA{R: 0xE8, G: 0xF5, B: 0xE9, A: 0xFF}
 )
 
 type peerStore struct {
@@ -44,11 +47,15 @@ type peerStore struct {
 	peers map[string]network.Peer
 }
 
-type peerListItem struct {
-	peer        network.Peer
+type conversationItem struct {
+	id          string
+	title       string
+	subtitle    string
 	unread      int
 	lastMsg     string
 	lastMsgTime time.Time
+	isGroup     bool
+	groupID     string
 	selected    bool
 }
 
@@ -63,13 +70,17 @@ func main() {
 		window.ShowAndRun()
 		return
 	}
-	storePath := filepath.Join(application.Storage().RootURI().Path(), "history.json")
-	historyStore, err := history.Open(storePath)
+
+	storageDir := application.Storage().RootURI().Path()
+
+	historyStore, err := history.Open(filepath.Join(storageDir, "history.json"))
 	if err != nil {
 		dialog.ShowError(err, window)
 		window.ShowAndRun()
 		return
 	}
+
+	groupPersistence := group.NewPersistence(filepath.Join(storageDir, "groups.json"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -81,11 +92,35 @@ func main() {
 		return
 	}
 
-	peers := &peerStore{peers: make(map[string]network.Peer)}
-	var selectedPeer network.Peer
+	groupManager := group.NewManager()
+	groupDiscovery := group.NewGroupDiscovery()
+	historyAdapter := group.NewHistoryAdapter(historyStore)
+	notificationService := group.NewNotificationService(
+		&fyneNotifier{app: application},
+		historyAdapter,
+	)
+	relay := group.NewRelay()
 
-	peerListItems := make([]peerListItem, 0)
-	var peerListWidget *widget.List
+	persistedGroups, err := groupPersistence.Load()
+	if err != nil {
+		dialog.ShowError(err, window)
+		window.ShowAndRun()
+		return
+	}
+	for _, g := range persistedGroups {
+		if err := groupManager.AddGroup(g); err != nil {
+			continue
+		}
+		if err := relay.RegisterGroup(g); err != nil {
+			continue
+		}
+	}
+
+	peers := &peerStore{peers: make(map[string]network.Peer)}
+	var selectedConversationID string
+
+	conversationItems := make([]conversationItem, 0)
+	var conversationListWidget *widget.List
 
 	chatMessagesContainer := container.NewVBox()
 	chatScroll := container.NewVScroll(chatMessagesContainer)
@@ -107,16 +142,25 @@ func main() {
 		),
 	)
 
-	updatePeerListUI := func() {}
+	updateConversationListUI := func() {}
 
-	buildChatBubble := func(msg history.Message) fyne.CanvasObject {
+	buildChatBubble := func(msg history.Message, senderName string) fyne.CanvasObject {
 		timeStr := msg.SentAt.Format("15:04")
 		displayTime := timeStr
 		if msg.Outgoing {
 			displayTime = timeStr + "  ✓✓"
 		}
 
-		textCanvas := canvas.NewText(msg.Text, colorTextDark)
+		var displayText string
+		if msg.Outgoing {
+			displayText = msg.Text
+		} else if senderName != "" {
+			displayText = senderName + "\n" + msg.Text
+		} else {
+			displayText = msg.Text
+		}
+
+		textCanvas := canvas.NewText(displayText, colorTextDark)
 		textCanvas.TextSize = 14
 
 		timeCanvas := canvas.NewText(displayTime, colorTextSub)
@@ -145,67 +189,110 @@ func main() {
 		)
 
 		if msg.Outgoing {
-			// OUTGOING: spacer fleksibel di kiri, bubble di kanan
 			return container.NewHBox(
 				layout.NewSpacer(),
 				bubble,
 			)
 		}
-		// INCOMING: bubble di kiri, spacer fleksibel di kanan
 		return container.NewHBox(
 			bubble,
 			layout.NewSpacer(),
 		)
 	}
 
-	renderConversation := func(peer network.Peer) {
-		_ = historyStore.MarkAsRead(history.DirectID(peer.ID))
-		roomTitle.SetText(peer.Name)
+	renderConversation := func(convID string) {
+		_ = historyStore.MarkAsRead(convID)
+		chatMessagesContainer.Objects = nil
 
-		if isPeerOnline(peer) {
-			roomStatusDot.FillColor = colorGreen
-			roomSubtitle.SetText(fmt.Sprintf("● Online • %s:%d", peer.Address, peer.Port))
+		var title string
+		var subtitle string
+
+		if strings.HasPrefix(convID, "group:") {
+			groupID := strings.TrimPrefix(convID, "group:")
+			g, exists := groupManager.GetGroup(groupID)
+			if exists {
+				title = g.Name
+				if g.Closed {
+					subtitle = fmt.Sprintf("● Closed • Code: %s", g.Code)
+					roomStatusDot.FillColor = colorGray
+				} else {
+					subtitle = fmt.Sprintf("● Group • %s • Code: %s", g.JoinPolicy.String(), g.Code)
+					roomStatusDot.FillColor = colorGreen
+				}
+			} else {
+				title = "Group"
+				subtitle = "Unknown group"
+				roomStatusDot.FillColor = colorGray
+			}
 		} else {
-			roomStatusDot.FillColor = colorGray
-			roomSubtitle.SetText(fmt.Sprintf("○ Offline • %s:%d", peer.Address, peer.Port))
+			peerID := strings.TrimPrefix(convID, "direct:")
+			peers.mu.Lock()
+			peer, exists := peers.peers[peerID]
+			peers.mu.Unlock()
+			if exists {
+				title = peer.Name
+				if isPeerOnline(peer) {
+					roomStatusDot.FillColor = colorGreen
+					subtitle = fmt.Sprintf("● Online • %s:%d", peer.Address, peer.Port)
+				} else {
+					roomStatusDot.FillColor = colorGray
+					subtitle = fmt.Sprintf("○ Offline • %s:%d", peer.Address, peer.Port)
+				}
+			} else {
+				title = peerID
+				subtitle = "Offline"
+				roomStatusDot.FillColor = colorGray
+			}
 		}
+
+		roomTitle.SetText(title)
+		roomSubtitle.SetText(subtitle)
 		roomStatusDot.Refresh()
 
-		msgs := historyStore.Messages(history.DirectID(peer.ID))
-		chatMessagesContainer.Objects = nil
+		msgs := historyStore.Messages(convID)
 		if len(msgs) == 0 {
-			emptyLabel := widget.NewLabel("Belum ada pesan dengan " + peer.Name + ".")
+			emptyLabel := widget.NewLabel("Belum ada pesan.")
 			emptyLabel.Alignment = fyne.TextAlignCenter
 			emptyLabel.Importance = widget.LowImportance
 			chatMessagesContainer.Add(emptyLabel)
 		} else {
 			for _, msg := range msgs {
-				chatMessagesContainer.Add(buildChatBubble(msg))
+				senderName := msg.SenderName
+				if msg.Outgoing {
+					senderName = ""
+				}
+				chatMessagesContainer.Add(buildChatBubble(msg, senderName))
 			}
 		}
 		chatMessagesContainer.Refresh()
 		chatScroll.ScrollToBottom()
-		updatePeerListUI()
+		updateConversationListUI()
 	}
 
-	appendStoredMessage := func(peer network.Peer, msg history.Message) {
-		conv := history.Conversation{ID: history.DirectID(peer.ID), Type: history.DirectConversation, Title: peer.Name, Participant: peer.ID}
+	appendStoredMessage := func(convID string, convType string, title string, msg history.Message) {
+		conv := history.Conversation{
+			ID:        convID,
+			Type:      convType,
+			Title:     title,
+			UpdatedAt: msg.SentAt,
+		}
 		if err := historyStore.AddMessage(conv, msg); err != nil {
 			dialog.ShowError(err, window)
 			return
 		}
-		if selectedPeer.ID == peer.ID {
-			renderConversation(peer)
+		if selectedConversationID == convID {
+			renderConversation(convID)
 		} else {
-			updatePeerListUI()
+			updateConversationListUI()
 		}
 	}
 
-	buildPeerListItems := func(store *peerStore, hs *history.Store, selected network.Peer) []peerListItem {
+	buildConversationItems := func(store *peerStore, hs *history.Store, gm *group.Manager, selected string) []conversationItem {
 		store.mu.Lock()
 		defer store.mu.Unlock()
 
-		items := make([]peerListItem, 0, len(store.peers))
+		items := make([]conversationItem, 0)
+
 		for id, peer := range store.peers {
 			convID := history.DirectID(id)
 			msgs := hs.Messages(convID)
@@ -222,29 +309,66 @@ func main() {
 					break
 				}
 			}
-			items = append(items, peerListItem{
-				peer:        peer,
+			items = append(items, conversationItem{
+				id:          convID,
+				title:       peer.Name,
+				subtitle:    peer.Address,
 				unread:      unread,
 				lastMsg:     lastMsg,
 				lastMsgTime: lastTime,
-				selected:    selected.ID == peer.ID,
+				isGroup:     false,
+				selected:    selected == convID,
 			})
 		}
+
+		for _, g := range gm.AllGroups() {
+			convID := history.GroupID(g.ID)
+			msgs := hs.Messages(convID)
+			unread := 0
+			var lastMsg string
+			var lastTime time.Time
+			if len(msgs) > 0 {
+				lastMsg = msgs[len(msgs)-1].Text
+				lastTime = msgs[len(msgs)-1].SentAt
+			}
+			for _, conv := range hs.Conversations() {
+				if conv.ID == convID {
+					unread = conv.UnreadCount
+					break
+				}
+			}
+			subtitle := fmt.Sprintf("Group • %s", g.JoinPolicy.String())
+			if g.Closed {
+				subtitle = "Group • Closed"
+			}
+			items = append(items, conversationItem{
+				id:          convID,
+				title:       g.Name,
+				subtitle:    subtitle,
+				unread:      unread,
+				lastMsg:     lastMsg,
+				lastMsgTime: lastTime,
+				isGroup:     true,
+				groupID:     g.ID,
+				selected:    selected == convID,
+			})
+		}
+
 		sort.Slice(items, func(i, j int) bool {
-			return items[i].peer.Name < items[j].peer.Name
+			return items[i].title < items[j].title
 		})
 		return items
 	}
 
-	updatePeerListUI = func() {
-		peerListItems = buildPeerListItems(peers, historyStore, selectedPeer)
-		if peerListWidget != nil {
-			peerListWidget.Refresh()
+	updateConversationListUI = func() {
+		conversationItems = buildConversationItems(peers, historyStore, groupManager, selectedConversationID)
+		if conversationListWidget != nil {
+			conversationListWidget.Refresh()
 		}
 	}
 
-	peerListWidget = widget.NewList(
-		func() int { return len(peerListItems) },
+	conversationListWidget = widget.NewList(
+		func() int { return len(conversationItems) },
 		func() fyne.CanvasObject {
 			statusDot := canvas.NewCircle(colorGray)
 			statusDot.Resize(fyne.NewSize(10, 10))
@@ -252,9 +376,9 @@ func main() {
 			nameLabel := widget.NewLabel("")
 			nameLabel.TextStyle = fyne.TextStyle{Bold: true}
 
-			ipLabel := widget.NewLabel("")
-			ipLabel.TextStyle = fyne.TextStyle{Italic: true}
-			ipLabel.Importance = widget.LowImportance
+			subtitleLabel := widget.NewLabel("")
+			subtitleLabel.TextStyle = fyne.TextStyle{Italic: true}
+			subtitleLabel.Importance = widget.LowImportance
 
 			lastMsgLabel := widget.NewLabel("")
 			lastMsgLabel.Wrapping = fyne.TextTruncate
@@ -270,16 +394,16 @@ func main() {
 				bgRect,
 				container.NewPadded(container.NewVBox(
 					container.NewHBox(statusDot, nameLabel),
-					container.NewHBox(widget.NewLabel("   "), ipLabel),
+					container.NewHBox(widget.NewLabel("   "), subtitleLabel),
 					container.NewHBox(widget.NewLabel("   "), lastMsgLabel, unreadBadge),
 				)),
 			)
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			if id >= len(peerListItems) {
+			if id >= len(conversationItems) {
 				return
 			}
-			item := peerListItems[id]
+			item := conversationItems[id]
 			stack := obj.(*fyne.Container)
 			bgRect := stack.Objects[0].(*canvas.Rectangle)
 			padded := stack.Objects[1].(*fyne.Container)
@@ -289,22 +413,22 @@ func main() {
 			statusDot := statusRow.Objects[0].(*canvas.Circle)
 			nameLabel := statusRow.Objects[1].(*widget.Label)
 
-			ipRow := vbox.Objects[1].(*fyne.Container)
-			ipLabel := ipRow.Objects[1].(*widget.Label)
+			subtitleRow := vbox.Objects[1].(*fyne.Container)
+			subtitleLabel := subtitleRow.Objects[1].(*widget.Label)
 
 			lastRow := vbox.Objects[2].(*fyne.Container)
 			lastMsgLabel := lastRow.Objects[1].(*widget.Label)
 			unreadBadge := lastRow.Objects[2].(*widget.Label)
 
-			if isPeerOnline(item.peer) {
-				statusDot.FillColor = colorGreen
+			if item.isGroup {
+				statusDot.FillColor = colorGroupBg
 			} else {
 				statusDot.FillColor = colorGray
 			}
 			statusDot.Refresh()
 
-			nameLabel.SetText(item.peer.Name)
-			ipLabel.SetText(item.peer.Address)
+			nameLabel.SetText(item.title)
+			subtitleLabel.SetText(item.subtitle)
 
 			if item.lastMsgTime.IsZero() {
 				lastMsgLabel.SetText("")
@@ -326,36 +450,137 @@ func main() {
 			bgRect.Refresh()
 		},
 	)
-	peerListWidget.OnSelected = func(id widget.ListItemID) {
-		if id >= len(peerListItems) {
+	conversationListWidget.OnSelected = func(id widget.ListItemID) {
+		if id >= len(conversationItems) {
 			return
 		}
-		item := peerListItems[id]
-		selectedPeer = item.peer
-		renderConversation(selectedPeer)
+		item := conversationItems[id]
+		selectedConversationID = item.id
+		renderConversation(selectedConversationID)
 	}
 
 	input := widget.NewEntry()
 	input.SetPlaceHolder("Ketik pesan...")
 
+	getLocalAddress := func() string {
+		conn, err := net.Dial("udp", "224.0.0.250:9999")
+		if err != nil {
+			return ""
+		}
+		defer conn.Close()
+		localAddr := conn.LocalAddr().(*net.UDPAddr)
+		return localAddr.IP.String()
+	}
+
 	sendMessage := func() {
 		text := strings.TrimSpace(input.Text)
-		if text == "" || selectedPeer.ID == "" {
+		if text == "" || selectedConversationID == "" {
 			return
 		}
-		msg := network.Message{From: ident.DisplayName, FromID: ident.ID, Text: text, Time: time.Now()}
-		peer := selectedPeer
-		go func() {
-			if err := network.SendMessage(peer, msg); err != nil {
-				fyne.Do(func() { dialog.ShowError(err, window) })
+
+		if strings.HasPrefix(selectedConversationID, "group:") {
+			groupID := strings.TrimPrefix(selectedConversationID, "group:")
+			g, exists := groupManager.GetGroup(groupID)
+			if !exists {
+				dialog.ShowError(fmt.Errorf("group not found"), window)
 				return
 			}
-			fyne.Do(func() {
-				appendStoredMessage(peer, history.Message{SenderID: ident.ID, SenderName: ident.DisplayName, Text: text, SentAt: msg.Time, Outgoing: true})
-			})
-		}()
-		input.SetText("")
-		window.Canvas().Focus(input)
+			if g.Closed {
+				dialog.ShowError(fmt.Errorf("group is closed"), window)
+				return
+			}
+			if !g.HasMember(ident.ID) {
+				dialog.ShowError(fmt.Errorf("you are not a member of this group"), window)
+				return
+			}
+
+			msgID, err := group.NewMessageID()
+			if err != nil {
+				dialog.ShowError(err, window)
+				return
+			}
+			gmsg := group.GroupMessage{
+				MessageID:  msgID,
+				GroupID:    groupID,
+				SenderID:   ident.ID,
+				SenderName: ident.DisplayName,
+				Body:       text,
+				Timestamp:  time.Now(),
+			}
+
+			if err := historyAdapter.SaveOutgoing(g, gmsg); err != nil {
+				dialog.ShowError(err, window)
+				return
+			}
+
+			if g.IsHost(ident.ID) {
+				targets, err := relay.GetRelayTargets(groupID, ident.ID)
+				if err == nil && len(targets) > 0 {
+					relayMsg := network.Message{
+						Type:       "group",
+						MessageID:  msgID,
+						GroupID:    groupID,
+						SenderID:   ident.ID,
+						SenderName: ident.DisplayName,
+						Body:       text,
+						Time:       time.Now(),
+					}
+					for _, target := range targets {
+						go func(addr string, port int) {
+							_ = network.SendToAddress(addr, port, relayMsg)
+						}(target.Address, target.Port)
+					}
+				}
+			} else {
+				peers.mu.Lock()
+				hostPeer, hostExists := peers.peers[g.HostID]
+				peers.mu.Unlock()
+				if hostExists && isPeerOnline(hostPeer) {
+					relayMsg := network.Message{
+						Type:       "group",
+						MessageID:  msgID,
+						GroupID:    groupID,
+						SenderID:   ident.ID,
+						SenderName: ident.DisplayName,
+						Body:       text,
+						Time:       time.Now(),
+					}
+					go func() {
+						if err := network.SendMessage(hostPeer, relayMsg); err != nil {
+							fyne.Do(func() { dialog.ShowError(err, window) })
+						}
+					}()
+				} else {
+					dialog.ShowError(fmt.Errorf("host is offline"), window)
+				}
+			}
+
+			renderConversation(selectedConversationID)
+			input.SetText("")
+			window.Canvas().Focus(input)
+		} else {
+			peerID := strings.TrimPrefix(selectedConversationID, "direct:")
+			peers.mu.Lock()
+			peer, exists := peers.peers[peerID]
+			peers.mu.Unlock()
+			if !exists {
+				return
+			}
+			msg := network.Message{From: ident.DisplayName, FromID: ident.ID, Text: text, Time: time.Now()}
+			go func() {
+				if err := network.SendMessage(peer, msg); err != nil {
+					fyne.Do(func() { dialog.ShowError(err, window) })
+					return
+				}
+				fyne.Do(func() {
+					appendStoredMessage(history.DirectID(peer.ID), history.DirectConversation, peer.Name, history.Message{
+						SenderID: ident.ID, SenderName: ident.DisplayName, Text: text, SentAt: msg.Time, Outgoing: true,
+					})
+				})
+			}()
+			input.SetText("")
+			window.Canvas().Focus(input)
+		}
 	}
 
 	input.OnSubmitted = func(_ string) {
@@ -378,6 +603,190 @@ func main() {
 	refreshButton := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
 		discovery.Refresh()
 	})
+
+	saveGroup := func(g *group.Group) {
+		_ = groupPersistence.SaveGroup(g)
+	}
+
+	showCreateGroupDialog := func() {
+		nameEntry := widget.NewEntry()
+		nameEntry.SetPlaceHolder("Group Name")
+
+		policySelect := widget.NewSelect([]string{"OPEN", "LOCKED"}, func(_ string) {})
+		policySelect.SetSelected("OPEN")
+
+		form := container.NewVBox(
+			widget.NewLabel("Group Name:"),
+			nameEntry,
+			widget.NewLabel("Join Policy:"),
+			policySelect,
+		)
+
+		dialog.ShowCustomConfirm("Create New Group", "Create", "Cancel", form, func(ok bool) {
+			if !ok {
+				return
+			}
+			name := strings.TrimSpace(nameEntry.Text)
+			if name == "" {
+				dialog.ShowError(fmt.Errorf("group name is required"), window)
+				return
+			}
+
+			var policy group.JoinPolicy
+			if policySelect.Selected == "LOCKED" {
+				policy = group.Locked
+			} else {
+				policy = group.Open
+			}
+
+			g, err := group.Create(name, ident.ID, policy)
+			if err != nil {
+				dialog.ShowError(err, window)
+				return
+			}
+			if err := g.SetHostDisplayName(ident.DisplayName); err != nil {
+				dialog.ShowError(err, window)
+				return
+			}
+			if err := groupManager.AddGroup(g); err != nil {
+				dialog.ShowError(err, window)
+				return
+			}
+			if err := relay.RegisterGroup(g); err != nil {
+				dialog.ShowError(err, window)
+				return
+			}
+			localAddr := getLocalAddress()
+			if localAddr != "" {
+				_ = relay.SetMemberPeer(g.ID, ident.ID, localAddr, server.Port())
+			}
+
+			saveGroup(g)
+
+			updateGroupAdvertisements(discovery, groupManager, ident.DisplayName, getLocalAddress(), server.Port())
+
+			codeDisplay := widget.NewLabel(g.Code)
+			codeDisplay.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
+
+			copyButton := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func() {
+				window.Clipboard().SetContent(g.Code)
+			})
+
+			resultContent := container.NewVBox(
+				widget.NewLabel("Group created successfully!"),
+				widget.NewLabel(""),
+				widget.NewLabel("Group:"),
+				widget.NewLabel(g.Name),
+				widget.NewLabel(""),
+				widget.NewLabel("Group Code:"),
+				container.NewHBox(codeDisplay, copyButton),
+			)
+			dialog.ShowCustom("Group Created", "OK", resultContent, window)
+
+			selectedConversationID = history.GroupID(g.ID)
+			renderConversation(selectedConversationID)
+			updateConversationListUI()
+		}, window)
+	}
+
+	showJoinGroupDialog := func() {
+		codeEntry := widget.NewEntry()
+		codeEntry.SetPlaceHolder("8-digit Group Code")
+
+		form := container.NewVBox(
+			widget.NewLabel("Enter Group Code:"),
+			codeEntry,
+		)
+
+		dialog.ShowCustomConfirm("Join Group", "Join", "Cancel", form, func(ok bool) {
+			if !ok {
+				return
+			}
+			code := group.FormatGroupCode(codeEntry.Text)
+			if code == "" {
+				dialog.ShowError(fmt.Errorf("group code must be exactly 8 digits"), window)
+				return
+			}
+
+			go func() {
+				ad, err := groupDiscovery.FindByCode(code)
+				if err == group.ErrGroupNotFound {
+					fyne.Do(func() { dialog.ShowError(fmt.Errorf("group not found"), window) })
+					return
+				}
+				if err == group.ErrGroupCodeAmbiguous {
+					fyne.Do(func() { dialog.ShowError(fmt.Errorf("multiple groups found with this code"), window) })
+					return
+				}
+				if err != nil {
+					fyne.Do(func() { dialog.ShowError(err, window) })
+					return
+				}
+
+				fyne.Do(func() {
+					if ad.JoinPolicy == group.Open {
+						g := &group.Group{
+							ID:         ad.ID,
+							Code:       ad.Code,
+							Name:       ad.Name,
+							HostID:     ad.HostID,
+							JoinPolicy: group.Open,
+							Members:    make(map[string]group.Member),
+							CreatedAt:  time.Now(),
+							Closed:     false,
+						}
+						g.Members[ad.HostID] = group.Member{ID: ad.HostID, Name: ad.HostName, Role: group.RoleHost, JoinedAt: time.Now()}
+						g.Members[ident.ID] = group.Member{ID: ident.ID, Name: ident.DisplayName, Role: group.RoleMember, JoinedAt: time.Now()}
+
+						if err := groupManager.AddGroup(g); err != nil {
+							dialog.ShowError(err, window)
+							return
+						}
+						if err := relay.RegisterGroup(g); err != nil {
+							dialog.ShowError(err, window)
+							return
+						}
+						saveGroup(g)
+						selectedConversationID = history.GroupID(g.ID)
+						renderConversation(selectedConversationID)
+						updateConversationListUI()
+						dialog.ShowInformation("Joined", fmt.Sprintf("You joined %s", ad.Name), window)
+					} else {
+						peers.mu.Lock()
+						hostPeer, hostExists := peers.peers[ad.HostID]
+						peers.mu.Unlock()
+
+						if !hostExists || !isPeerOnline(hostPeer) {
+							dialog.ShowError(fmt.Errorf("host is offline"), window)
+							return
+						}
+
+						joinMsg := network.Message{
+							Type:          "join_request",
+							GroupID:       ad.ID,
+							RequesterID:   ident.ID,
+							RequesterName: ident.DisplayName,
+							Time:          time.Now(),
+						}
+						go func() {
+							if err := network.SendMessage(hostPeer, joinMsg); err != nil {
+								fyne.Do(func() { dialog.ShowError(err, window) })
+								return
+							}
+							fyne.Do(func() {
+								dialog.ShowInformation("Pending", "Join request sent. Waiting for host approval.", window)
+							})
+						}()
+					}
+				})
+			}()
+		}, window)
+	}
+
+	groupMenu := fyne.NewMenu("Groups",
+		fyne.NewMenuItem("Create New Group", showCreateGroupDialog),
+		fyne.NewMenuItem("Join Group", showJoinGroupDialog),
+	)
 
 	var showNameDialog func(first bool)
 	showNameDialog = func(first bool) {
@@ -407,11 +816,26 @@ func main() {
 	}
 
 	deleteConversation := func() {
-		if selectedPeer.ID != "" {
-			dialog.ShowConfirm("Hapus percakapan", "Hapus riwayat lokal dengan "+selectedPeer.Name+"? Riwayat di perangkat lain tidak terpengaruh.", func(ok bool) {
+		if selectedConversationID != "" {
+			var title string
+			if strings.HasPrefix(selectedConversationID, "group:") {
+				groupID := strings.TrimPrefix(selectedConversationID, "group:")
+				if g, exists := groupManager.GetGroup(groupID); exists {
+					title = g.Name
+				}
+			} else {
+				title = selectedConversationID
+			}
+			dialog.ShowConfirm("Hapus percakapan", "Hapus riwayat lokal "+title+"? Riwayat di perangkat lain tidak terpengaruh.", func(ok bool) {
 				if ok {
-					_ = historyStore.DeleteConversation(history.DirectID(selectedPeer.ID))
-					renderConversation(selectedPeer)
+					_ = historyStore.DeleteConversation(selectedConversationID)
+					selectedConversationID = ""
+					chatMessagesContainer.Objects = nil
+					emptyLabel := widget.NewLabel("Pilih percakapan")
+					emptyLabel.Alignment = fyne.TextAlignCenter
+					chatMessagesContainer.Add(emptyLabel)
+					chatMessagesContainer.Refresh()
+					updateConversationListUI()
 				}
 			}, window)
 		}
@@ -420,27 +844,38 @@ func main() {
 		dialog.ShowConfirm("Hapus semua riwayat", "Hapus semua riwayat chat lokal di perangkat ini?", func(ok bool) {
 			if ok {
 				_ = historyStore.DeleteAll()
-				if selectedPeer.ID != "" {
-					renderConversation(selectedPeer)
-				} else {
-					chatMessagesContainer.Objects = nil
-					emptyLabel := widget.NewLabel("Pesan LAN akan muncul di sini...")
-					emptyLabel.Alignment = fyne.TextAlignCenter
-					chatMessagesContainer.Add(emptyLabel)
-					chatMessagesContainer.Refresh()
-				}
-				updatePeerListUI()
+				selectedConversationID = ""
+				chatMessagesContainer.Objects = nil
+				emptyLabel := widget.NewLabel("Pesan LAN akan muncul di sini...")
+				emptyLabel.Alignment = fyne.TextAlignCenter
+				chatMessagesContainer.Add(emptyLabel)
+				chatMessagesContainer.Refresh()
+				updateConversationListUI()
 			}
 		}, window)
 	}
-	window.SetMainMenu(fyne.NewMainMenu(fyne.NewMenu("Settings", fyne.NewMenuItem("Change display name", func() { showNameDialog(false) }), fyne.NewMenuItem("Delete conversation", deleteConversation), fyne.NewMenuItem("Delete all history", deleteAll))))
 
-	peersTitle := widget.NewLabel("Peers")
+	window.SetMainMenu(fyne.NewMainMenu(
+		groupMenu,
+		fyne.NewMenu("Settings",
+			fyne.NewMenuItem("Change display name", func() { showNameDialog(false) }),
+			fyne.NewMenuItem("Delete conversation", deleteConversation),
+			fyne.NewMenuItem("Delete all history", deleteAll),
+		),
+	))
+
+	peersTitle := widget.NewLabel("Chats")
 	peersTitle.TextStyle = fyne.TextStyle{Bold: true}
+
+	createGroupBtn := widget.NewButtonWithIcon("New Group", theme.ContentAddIcon(), showCreateGroupDialog)
+	joinGroupBtn := widget.NewButtonWithIcon("Join", theme.LoginIcon(), showJoinGroupDialog)
+
+	sidebarActions := container.NewHBox(createGroupBtn, joinGroupBtn)
+
 	leftPanel := container.NewBorder(
-		peersTitle,
+		container.NewVBox(peersTitle, sidebarActions),
 		nil, nil, nil,
-		peerListWidget,
+		conversationListWidget,
 	)
 
 	chatInputRow := container.NewBorder(nil, nil, nil, sendButton, input)
@@ -474,41 +909,101 @@ func main() {
 	)
 	window.SetContent(content)
 
-	updatePeerListUI()
+	go func() {
+		if err := discovery.Run(ctx); err != nil && ctx.Err() == nil {
+			fyne.Do(func() { dialog.ShowError(err, window) })
+		}
+	}()
+
+	updateGroupAdvertisements(discovery, groupManager, ident.DisplayName, getLocalAddress(), server.Port())
+
+	updateConversationListUI()
 
 	go func() {
 		if err := server.Run(ctx); err != nil {
 			fyne.Do(func() { dialog.ShowError(err, window) })
 		}
 	}()
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case peer, ok := <-discovery.Peers():
+				if !ok {
+					return
+				}
+				peers.mu.Lock()
+				peers.peers[peer.ID] = peer
+				peers.mu.Unlock()
+
+				if len(peer.Groups) > 0 {
+					for _, ad := range peer.Groups {
+						groupDiscovery.Upsert(ad)
+					}
+				}
+
+				fyne.Do(func() {
+					updateConversationListUI()
+				})
+			}
+		}
+	}()
+
 	go func() {
 		for msg := range server.Incoming() {
 			message := msg
 			fyne.Do(func() {
-				peers.mu.Lock()
-				knownPeer, exists := peers.peers[message.FromID]
-				peers.mu.Unlock()
+				switch message.Type {
+				case "group":
+					handleIncomingGroupMessage(message, groupManager, historyAdapter, notificationService, relay, &selectedConversationID, renderConversation, updateConversationListUI, ident.ID)
+				case "join_request":
+					handleIncomingJoinRequest(message, groupManager)
+				case "join_accept":
+					handleIncomingJoinAccept(message, groupManager, groupPersistence)
+				case "join_reject":
+					handleIncomingJoinReject(message, groupManager)
+				default:
+					peers.mu.Lock()
+					knownPeer, exists := peers.peers[message.FromID]
+					peers.mu.Unlock()
 
-				var peer network.Peer
-				if exists {
-					peer = knownPeer
-				} else {
-					peer = network.Peer{ID: message.FromID, Name: message.From}
-					if peer.ID == "" {
-						peer.ID = message.From
+					var peer network.Peer
+					if exists {
+						peer = knownPeer
+					} else {
+						peer = network.Peer{ID: message.FromID, Name: message.From}
+						if peer.ID == "" {
+							peer.ID = message.From
+						}
 					}
-				}
 
-				appendStoredMessage(peer, history.Message{SenderID: peer.ID, SenderName: message.From, Text: message.Text, SentAt: message.Time})
-				sendNotification(application, peer.Name, message.Text)
+					appendStoredMessage(history.DirectID(peer.ID), history.DirectConversation, peer.Name, history.Message{
+						SenderID: peer.ID, SenderName: message.From, Text: message.Text, SentAt: message.Time,
+					})
+					sendNotification(application, peer.Name, message.Text)
+				}
 			})
 		}
 	}()
-	go runDiscovery(ctx, discovery, peers, updatePeerListUI, &selectedPeer)
-	go checkPeerTimeout(ctx, peers, updatePeerListUI)
+
+	go checkPeerTimeout(ctx, peers, updateConversationListUI)
 
 	window.SetCloseIntercept(func() { cancel(); window.Close() })
 	window.ShowAndRun()
+}
+
+// fyneNotifier implements group.Notifier using Fyne notifications.
+type fyneNotifier struct {
+	app fyne.App
+}
+
+func (n *fyneNotifier) SendNotification(title, content string) {
+	n.app.SendNotification(&fyne.Notification{
+		Title:   title,
+		Content: content,
+	})
 }
 
 func sendNotification(app fyne.App, title, content string) {
@@ -518,26 +1013,129 @@ func sendNotification(app fyne.App, title, content string) {
 	})
 }
 
-func runDiscovery(ctx context.Context, discovery *network.Discovery, store *peerStore, onUpdate func(), selectedPeer *network.Peer) {
-	go func() { _ = discovery.Run(ctx) }()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case peer := <-discovery.Peers():
-			store.mu.Lock()
-			store.peers[peer.ID] = peer
-			if selectedPeer.ID == "" {
-				*selectedPeer = peer
-			} else if selectedPeer.ID == peer.ID {
-				*selectedPeer = peer
-			}
-			store.mu.Unlock()
-			fyne.Do(func() {
-				onUpdate()
+func updateGroupAdvertisements(discovery *network.Discovery, gm *group.Manager, hostName string, hostAddr string, hostPort int) {
+	var ads []group.GroupAdvertisement
+	for _, g := range gm.AllGroups() {
+		if !g.Closed {
+			ads = append(ads, group.GroupAdvertisement{
+				ID:         g.ID,
+				Code:       g.Code,
+				Name:       g.Name,
+				HostID:     g.HostID,
+				JoinPolicy: g.JoinPolicy,
+				HostName:   hostName,
+				HostAddr:   hostAddr,
+				HostPort:   hostPort,
 			})
 		}
 	}
+	discovery.SetGroups(ads)
+	discovery.Refresh()
+}
+
+func handleIncomingGroupMessage(
+	msg network.Message,
+	gm *group.Manager,
+	adapter *group.HistoryAdapter,
+	notifier *group.NotificationService,
+	relay *group.Relay,
+	selectedConvID *string,
+	renderFn func(string),
+	updateFn func(),
+	localIdentityID string,
+) {
+	groupID := msg.GroupID
+	g, exists := gm.GetGroup(groupID)
+	if !exists {
+		return
+	}
+	if g.Closed {
+		return
+	}
+	if !g.HasMember(msg.SenderID) {
+		return
+	}
+
+	gmsg := group.GroupMessage{
+		MessageID:  msg.MessageID,
+		GroupID:    msg.GroupID,
+		SenderID:   msg.SenderID,
+		SenderName: msg.SenderName,
+		Body:       msg.Body,
+		Timestamp:  msg.Time,
+	}
+
+	if err := adapter.SaveIncoming(g, gmsg); err != nil {
+		return
+	}
+
+	_ = notifier.NotifyIncoming(g, gmsg)
+
+	if g.IsHost(localIdentityID) {
+		targets, err := relay.GetRelayTargets(groupID, msg.SenderID)
+		if err == nil && len(targets) > 0 {
+			relayMsg := network.Message{
+				Type:       "group",
+				MessageID:  msg.MessageID,
+				GroupID:    msg.GroupID,
+				SenderID:   msg.SenderID,
+				SenderName: msg.SenderName,
+				Body:       msg.Body,
+				Time:       msg.Time,
+			}
+			for _, target := range targets {
+				go func(addr string, port int) {
+					_ = network.SendToAddress(addr, port, relayMsg)
+				}(target.Address, target.Port)
+			}
+		}
+	}
+
+	if *selectedConvID == history.GroupID(groupID) {
+		renderFn(*selectedConvID)
+	} else {
+		updateFn()
+	}
+}
+
+func handleIncomingJoinRequest(msg network.Message, gm *group.Manager) {
+	groupID := msg.GroupID
+	g, exists := gm.GetGroup(groupID)
+	if !exists {
+		return
+	}
+	if g.Closed {
+		return
+	}
+
+	req := group.JoinRequest{
+		GroupID:       groupID,
+		RequesterID:   msg.RequesterID,
+		RequesterName: msg.RequesterName,
+		Status:        group.Pending,
+		Timestamp:     msg.Time,
+	}
+	_ = gm.AddJoinRequest(groupID, req)
+}
+
+func handleIncomingJoinAccept(msg network.Message, gm *group.Manager, persistence *group.Persistence) {
+	groupID := msg.GroupID
+	g, exists := gm.GetGroup(groupID)
+	if !exists {
+		return
+	}
+	_ = g.AddMember(msg.RequesterID, msg.From)
+	_ = gm.AcceptJoinRequest(groupID, msg.RequesterID, g.HostID)
+	_ = persistence.SaveGroup(g)
+}
+
+func handleIncomingJoinReject(msg network.Message, gm *group.Manager) {
+	groupID := msg.GroupID
+	g, exists := gm.GetGroup(groupID)
+	if !exists {
+		return
+	}
+	_ = gm.RejectJoinRequest(groupID, msg.RequesterID, g.HostID)
 }
 
 func checkPeerTimeout(ctx context.Context, store *peerStore, onUpdate func()) {

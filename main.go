@@ -7,6 +7,7 @@ import (
 	"net"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +58,18 @@ type conversationItem struct {
 	isGroup     bool
 	groupID     string
 	selected    bool
+}
+
+type pendingRequestItem struct {
+	GroupID       string
+	GroupName     string
+	RequesterID   string
+	RequesterName string
+}
+
+type pendingPeer struct {
+	Address string
+	Port    int
 }
 
 func main() {
@@ -118,6 +131,8 @@ func main() {
 
 	peers := &peerStore{peers: make(map[string]network.Peer)}
 	var selectedConversationID string
+	var pendingPeers sync.Map
+	var joinRequestsDialog *dialog.CustomDialog
 
 	conversationItems := make([]conversationItem, 0)
 	var conversationListWidget *widget.List
@@ -746,6 +761,10 @@ func main() {
 							dialog.ShowError(err, window)
 							return
 						}
+						localAddr := getLocalAddress()
+						if localAddr != "" {
+							_ = relay.SetMemberPeer(g.ID, ident.ID, localAddr, server.Port())
+						}
 						saveGroup(g)
 						selectedConversationID = history.GroupID(g.ID)
 						renderConversation(selectedConversationID)
@@ -892,8 +911,125 @@ func main() {
 	appTitle := widget.NewLabel("LocalCat")
 	appTitle.TextStyle = fyne.TextStyle{Bold: true}
 
+	var approveRequest func(string, string)
+	var rejectRequest func(string, string)
+
+	showJoinRequestsPlaceholder := func() {
+		if joinRequestsDialog != nil {
+			joinRequestsDialog.Hide()
+			joinRequestsDialog = nil
+		}
+
+		groups := groupManager.AllGroups()
+
+		var pendingRequests []pendingRequestItem
+
+		for _, g := range groups {
+			pr, exists := groupManager.GetPendingRequests(g.ID)
+			if !exists || pr.Count() == 0 {
+				continue
+			}
+			for _, req := range pr.All() {
+				pendingRequests = append(pendingRequests, pendingRequestItem{
+					GroupID:       g.ID,
+					GroupName:     g.Name,
+					RequesterID:   req.RequesterID,
+					RequesterName: req.RequesterName,
+				})
+			}
+		}
+
+		content := container.NewVBox(
+			widget.NewLabelWithStyle("Join Requests", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+			widget.NewSeparator(),
+		)
+
+		if len(pendingRequests) == 0 {
+			content.Add(widget.NewLabel("No pending join requests."))
+		} else {
+			for _, req := range pendingRequests {
+				row := container.NewVBox(
+					widget.NewLabelWithStyle(fmt.Sprintf("Group: %s", req.GroupName), fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+					widget.NewLabel(fmt.Sprintf("Requester: %s", req.RequesterName)),
+					container.NewHBox(
+						widget.NewButton("Approve", func() {
+							approveRequest(req.GroupID, req.RequesterID)
+						}),
+						widget.NewButton("Reject", func() {
+							rejectRequest(req.GroupID, req.RequesterID)
+						}),
+					),
+					widget.NewSeparator(),
+				)
+				content.Add(row)
+			}
+		}
+
+		joinRequestsDialog = dialog.NewCustom("Join Requests", "Tutup", content, window)
+		joinRequestsDialog.SetOnClosed(func() {
+			joinRequestsDialog = nil
+		})
+		joinRequestsDialog.Show()
+	}
+
+	approveRequest = func(groupID, requesterID string) {
+		g, exists := groupManager.GetGroup(groupID)
+		if !exists {
+			dialog.ShowError(fmt.Errorf("group not found"), window)
+			return
+		}
+		if err := groupManager.AcceptJoinRequest(groupID, requesterID, ident.ID); err != nil {
+			dialog.ShowError(err, window)
+			return
+		}
+		if err := groupPersistence.SaveGroup(g); err != nil {
+			dialog.ShowError(err, window)
+			return
+		}
+		peers.mu.Lock()
+		requesterPeer, exists := peers.peers[requesterID]
+		peers.mu.Unlock()
+		if exists {
+			_ = relay.SetMemberPeer(groupID, requesterID, requesterPeer.Address, requesterPeer.Port)
+		}
+		if err := sendJoinAccept(peers, &ident, g, requesterID, &pendingPeers); err != nil {
+			dialog.ShowError(fmt.Errorf("approve succeeded but failed to notify requester: %v", err), window)
+		}
+		pendingPeers.Delete(requesterID)
+		showJoinRequestsPlaceholder()
+	}
+
+	rejectRequest = func(groupID, requesterID string) {
+		if err := groupManager.RejectJoinRequest(groupID, requesterID, ident.ID); err != nil {
+			dialog.ShowError(err, window)
+			return
+		}
+		if err := sendJoinReject(peers, &ident, requesterID, groupID, &pendingPeers); err != nil {
+			dialog.ShowError(fmt.Errorf("reject succeeded but failed to notify requester: %v", err), window)
+		}
+		pendingPeers.Delete(requesterID)
+		showJoinRequestsPlaceholder()
+	}
+
+	var menuButton *widget.Button
+
+	menuButton = widget.NewButtonWithIcon("", theme.MenuIcon(), func() {
+		menu := fyne.NewMenu("",
+			fyne.NewMenuItem("Settings", func() { showNameDialog(false) }),
+			fyne.NewMenuItem("Join Requests", showJoinRequestsPlaceholder),
+		)
+		popup := widget.NewPopUpMenu(menu, window.Canvas())
+		pos := menuButton.Position().Add(fyne.NewPos(0, menuButton.Size().Height))
+		popup.ShowAtPosition(pos)
+	})
+
 	topBar := container.NewVBox(
-		container.NewHBox(appTitle, refreshButton),
+		container.NewHBox(
+			menuButton,
+			appTitle,
+			layout.NewSpacer(),
+			refreshButton,
+		),
 		status,
 	)
 
@@ -944,6 +1080,15 @@ func main() {
 					}
 				}
 
+				for _, g := range groupManager.AllGroups() {
+					if g.Closed {
+						continue
+					}
+					if g.HasMember(peer.ID) {
+						_ = relay.SetMemberPeer(g.ID, peer.ID, peer.Address, peer.Port)
+					}
+				}
+
 				fyne.Do(func() {
 					updateConversationListUI()
 				})
@@ -951,38 +1096,54 @@ func main() {
 		}
 	}()
 
+	time.AfterFunc(3*time.Second, func() {
+		for _, g := range groupManager.AllGroups() {
+			if g.Closed {
+				continue
+			}
+			for memberID := range g.Members {
+				peers.mu.Lock()
+				peer, exists := peers.peers[memberID]
+				peers.mu.Unlock()
+				if exists {
+					_ = relay.SetMemberPeer(g.ID, memberID, peer.Address, peer.Port)
+				}
+			}
+		}
+	})
+
 	go func() {
-		for msg := range server.Incoming() {
-			message := msg
+		for im := range server.Incoming() {
+			msg := im.Message
 			fyne.Do(func() {
-				switch message.Type {
+				switch msg.Type {
 				case "group":
-					handleIncomingGroupMessage(message, groupManager, historyAdapter, notificationService, relay, &selectedConversationID, renderConversation, updateConversationListUI, ident.ID)
+					handleIncomingGroupMessage(msg, groupManager, historyAdapter, notificationService, relay, &selectedConversationID, renderConversation, updateConversationListUI, ident.ID)
 				case "join_request":
-					handleIncomingJoinRequest(message, groupManager)
+					handleIncomingJoinRequest(msg, groupManager, im.RemoteAddr, &pendingPeers)
 				case "join_accept":
-					handleIncomingJoinAccept(message, groupManager, groupPersistence)
+					handleIncomingJoinAccept(msg, groupManager, groupPersistence, relay, ident.ID)
 				case "join_reject":
-					handleIncomingJoinReject(message, groupManager)
+					handleIncomingJoinReject(msg, groupManager)
 				default:
 					peers.mu.Lock()
-					knownPeer, exists := peers.peers[message.FromID]
+					knownPeer, exists := peers.peers[msg.FromID]
 					peers.mu.Unlock()
 
 					var peer network.Peer
 					if exists {
 						peer = knownPeer
 					} else {
-						peer = network.Peer{ID: message.FromID, Name: message.From}
+						peer = network.Peer{ID: msg.FromID, Name: msg.From}
 						if peer.ID == "" {
-							peer.ID = message.From
+							peer.ID = msg.From
 						}
 					}
 
 					appendStoredMessage(history.DirectID(peer.ID), history.DirectConversation, peer.Name, history.Message{
-						SenderID: peer.ID, SenderName: message.From, Text: message.Text, SentAt: message.Time,
+						SenderID: peer.ID, SenderName: msg.From, Text: msg.Text, SentAt: msg.Time,
 					})
-					sendNotification(application, peer.Name, message.Text)
+					sendNotification(application, peer.Name, msg.Text)
 				}
 			})
 		}
@@ -1011,6 +1172,86 @@ func sendNotification(app fyne.App, title, content string) {
 		Title:   title,
 		Content: content,
 	})
+}
+
+func sendJoinAccept(peers *peerStore, ident *identity.Identity, g *group.Group, requesterID string, pendingPeers *sync.Map) error {
+	peers.mu.Lock()
+	peer, exists := peers.peers[requesterID]
+	peers.mu.Unlock()
+	if exists {
+		msg := network.Message{
+			Type:        "join_accept",
+			GroupID:     g.ID,
+			GroupName:   g.Name,
+			GroupCode:   g.Code,
+			JoinPolicy:  g.JoinPolicy,
+			RequesterID: requesterID,
+			From:        ident.DisplayName,
+			FromID:      ident.ID,
+			Time:        time.Now(),
+		}
+		return network.SendMessage(peer, msg)
+	}
+
+	if val, ok := pendingPeers.Load(requesterID); ok {
+		pp := val.(pendingPeer)
+		peer = network.Peer{
+			ID:      requesterID,
+			Address: pp.Address,
+			Port:    pp.Port,
+		}
+		msg := network.Message{
+			Type:        "join_accept",
+			GroupID:     g.ID,
+			GroupName:   g.Name,
+			GroupCode:   g.Code,
+			JoinPolicy:  g.JoinPolicy,
+			RequesterID: requesterID,
+			From:        ident.DisplayName,
+			FromID:      ident.ID,
+			Time:        time.Now(),
+		}
+		return network.SendMessage(peer, msg)
+	}
+
+	return fmt.Errorf("requester %s not found in peer store or pending peers", requesterID)
+}
+
+func sendJoinReject(peers *peerStore, ident *identity.Identity, requesterID, groupID string, pendingPeers *sync.Map) error {
+	peers.mu.Lock()
+	peer, exists := peers.peers[requesterID]
+	peers.mu.Unlock()
+	if exists {
+		msg := network.Message{
+			Type:        "join_reject",
+			GroupID:     groupID,
+			RequesterID: requesterID,
+			From:        ident.DisplayName,
+			FromID:      ident.ID,
+			Time:        time.Now(),
+		}
+		return network.SendMessage(peer, msg)
+	}
+
+	if val, ok := pendingPeers.Load(requesterID); ok {
+		pp := val.(pendingPeer)
+		peer = network.Peer{
+			ID:      requesterID,
+			Address: pp.Address,
+			Port:    pp.Port,
+		}
+		msg := network.Message{
+			Type:        "join_reject",
+			GroupID:     groupID,
+			RequesterID: requesterID,
+			From:        ident.DisplayName,
+			FromID:      ident.ID,
+			Time:        time.Now(),
+		}
+		return network.SendMessage(peer, msg)
+	}
+
+	return fmt.Errorf("requester %s not found in peer store or pending peers", requesterID)
 }
 
 func updateGroupAdvertisements(discovery *network.Discovery, gm *group.Manager, hostName string, hostAddr string, hostPort int) {
@@ -1098,7 +1339,7 @@ func handleIncomingGroupMessage(
 	}
 }
 
-func handleIncomingJoinRequest(msg network.Message, gm *group.Manager) {
+func handleIncomingJoinRequest(msg network.Message, gm *group.Manager, remoteAddr string, pendingPeers *sync.Map) {
 	groupID := msg.GroupID
 	g, exists := gm.GetGroup(groupID)
 	if !exists {
@@ -1106,6 +1347,12 @@ func handleIncomingJoinRequest(msg network.Message, gm *group.Manager) {
 	}
 	if g.Closed {
 		return
+	}
+
+	host, portStr, err := net.SplitHostPort(remoteAddr)
+	if err == nil {
+		port, _ := strconv.Atoi(portStr)
+		pendingPeers.Store(msg.RequesterID, pendingPeer{Address: host, Port: port})
 	}
 
 	req := group.JoinRequest{
@@ -1118,13 +1365,47 @@ func handleIncomingJoinRequest(msg network.Message, gm *group.Manager) {
 	_ = gm.AddJoinRequest(groupID, req)
 }
 
-func handleIncomingJoinAccept(msg network.Message, gm *group.Manager, persistence *group.Persistence) {
+func handleIncomingJoinAccept(msg network.Message, gm *group.Manager, persistence *group.Persistence, relay *group.Relay, localIdentityID string) {
 	groupID := msg.GroupID
 	g, exists := gm.GetGroup(groupID)
+
 	if !exists {
+		g = &group.Group{
+			ID:         msg.GroupID,
+			Code:       msg.GroupCode,
+			Name:       msg.GroupName,
+			HostID:     msg.FromID,
+			JoinPolicy: msg.JoinPolicy,
+			Members:    make(map[string]group.Member),
+			CreatedAt:  time.Now(),
+			Closed:     false,
+		}
+		g.Members[msg.FromID] = group.Member{ID: msg.FromID, Name: msg.From, Role: group.RoleHost, JoinedAt: time.Now()}
+		g.Members[localIdentityID] = group.Member{ID: localIdentityID, Name: msg.RequesterName, Role: group.RoleMember, JoinedAt: time.Now()}
+
+		if err := gm.AddGroup(g); err != nil {
+			return
+		}
+		if err := relay.RegisterGroup(g); err != nil {
+			return
+		}
+		if err := persistence.SaveGroup(g); err != nil {
+			return
+		}
 		return
 	}
-	_ = g.AddMember(msg.RequesterID, msg.From)
+
+	if g.Closed {
+		return
+	}
+
+	if _, exists := g.GetMember(msg.FromID); !exists {
+		_ = g.AddMember(msg.FromID, msg.From)
+	}
+	if _, exists := g.GetMember(msg.RequesterID); !exists {
+		_ = g.AddMember(msg.RequesterID, msg.RequesterName)
+	}
+
 	_ = gm.AcceptJoinRequest(groupID, msg.RequesterID, g.HostID)
 	_ = persistence.SaveGroup(g)
 }

@@ -7,6 +7,8 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"localcat/internal/group"
 )
 
 // Message is the JSON payload exchanged over TCP between LocalCat peers.
@@ -19,11 +21,14 @@ type Message struct {
 	Time   time.Time `json:"time"`              // Timestamp
 
 	// Group message fields
-	MessageID  string `json:"message_id,omitempty"`
-	GroupID    string `json:"group_id,omitempty"`
-	SenderID   string `json:"sender_id,omitempty"`
-	SenderName string `json:"sender_name,omitempty"`
-	Body       string `json:"body,omitempty"`
+	MessageID  string           `json:"message_id,omitempty"`
+	GroupID    string           `json:"group_id,omitempty"`
+	GroupName  string           `json:"group_name,omitempty"`
+	GroupCode  string           `json:"group_code,omitempty"`
+	JoinPolicy group.JoinPolicy `json:"join_policy,omitempty"`
+	SenderID   string           `json:"sender_id,omitempty"`
+	SenderName string           `json:"sender_name,omitempty"`
+	Body       string           `json:"body,omitempty"`
 
 	// Join request/response fields
 	RequesterID   string `json:"requester_id,omitempty"`

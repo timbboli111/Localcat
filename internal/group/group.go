@@ -357,3 +357,12 @@ func (pr *PendingRequests) Remove(requesterID string) {
 func (pr *PendingRequests) Count() int {
 	return len(pr.requests)
 }
+
+// All returns all pending join requests.
+func (pr *PendingRequests) All() []JoinRequest {
+	out := make([]JoinRequest, 0, len(pr.requests))
+	for _, req := range pr.requests {
+		out = append(out, req)
+	}
+	return out
+}

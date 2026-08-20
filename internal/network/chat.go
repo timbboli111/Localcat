@@ -10,10 +10,15 @@ import (
 	"time"
 )
 
+type IncomingMessage struct {
+	Message    Message
+	RemoteAddr string
+}
+
 // ChatServer accepts TCP messages from peers.
 type ChatServer struct {
 	listener net.Listener
-	incoming chan Message
+	incoming chan IncomingMessage
 }
 
 func NewChatServer() (*ChatServer, error) {
@@ -21,7 +26,7 @@ func NewChatServer() (*ChatServer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen tcp: %w", err)
 	}
-	return &ChatServer{listener: listener, incoming: make(chan Message, 64)}, nil
+	return &ChatServer{listener: listener, incoming: make(chan IncomingMessage, 64)}, nil
 }
 
 func (s *ChatServer) Port() int {
@@ -33,7 +38,7 @@ func (s *ChatServer) Port() int {
 	return port
 }
 
-func (s *ChatServer) Incoming() <-chan Message { return s.incoming }
+func (s *ChatServer) Incoming() <-chan IncomingMessage { return s.incoming }
 
 func (s *ChatServer) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
@@ -68,7 +73,7 @@ func (s *ChatServer) handleConnection(conn net.Conn) {
 			return
 		}
 		select {
-		case s.incoming <- msg:
+		case s.incoming <- IncomingMessage{Message: msg, RemoteAddr: conn.RemoteAddr().String()}:
 		default:
 		}
 	}

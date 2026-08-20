@@ -166,25 +166,37 @@ func main() {
 			displayTime = timeStr + "  ✓✓"
 		}
 
-		var displayText string
+		var textContent fyne.CanvasObject
+
 		if msg.Outgoing {
-			displayText = msg.Text
+			textCanvas := canvas.NewText(msg.Text, colorTextWhite)
+			textCanvas.TextSize = 14
+			timeCanvas := canvas.NewText(displayTime, colorTextWhite)
+			timeCanvas.TextSize = 11
+			timeCanvas.TextStyle = fyne.TextStyle{Italic: true}
+			textContent = container.NewVBox(textCanvas, timeCanvas)
 		} else if senderName != "" {
-			displayText = senderName + "\n" + msg.Text
+			userCanvas := canvas.NewText(senderName, colorTextDark)
+			userCanvas.TextSize = 14
+			userCanvas.TextStyle = fyne.TextStyle{Bold: true}
+
+			bodyCanvas := canvas.NewText(msg.Text, colorTextDark)
+			bodyCanvas.TextSize = 14
+
+			timeCanvas := canvas.NewText(displayTime, colorTextSub)
+			timeCanvas.TextSize = 11
+			timeCanvas.TextStyle = fyne.TextStyle{Italic: true}
+
+			textContent = container.NewVBox(userCanvas, bodyCanvas, timeCanvas)
 		} else {
-			displayText = msg.Text
-		}
+			bodyCanvas := canvas.NewText(msg.Text, colorTextDark)
+			bodyCanvas.TextSize = 14
 
-		textCanvas := canvas.NewText(displayText, colorTextDark)
-		textCanvas.TextSize = 14
+			timeCanvas := canvas.NewText(displayTime, colorTextSub)
+			timeCanvas.TextSize = 11
+			timeCanvas.TextStyle = fyne.TextStyle{Italic: true}
 
-		timeCanvas := canvas.NewText(displayTime, colorTextSub)
-		timeCanvas.TextSize = 11
-		timeCanvas.TextStyle = fyne.TextStyle{Italic: true}
-
-		if msg.Outgoing {
-			textCanvas.Color = colorTextWhite
-			timeCanvas.Color = colorTextWhite
+			textContent = container.NewVBox(bodyCanvas, timeCanvas)
 		}
 
 		bubbleBg := canvas.NewRectangle(colorIncomingBg)
@@ -193,14 +205,9 @@ func main() {
 		}
 		bubbleBg.CornerRadius = 14
 
-		bubbleContent := container.NewVBox(
-			textCanvas,
-			timeCanvas,
-		)
-
 		bubble := container.NewStack(
 			bubbleBg,
-			container.NewPadded(bubbleContent),
+			container.NewPadded(textContent),
 		)
 
 		if msg.Outgoing {

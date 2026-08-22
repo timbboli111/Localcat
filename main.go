@@ -72,6 +72,64 @@ type pendingPeer struct {
 	Port    int
 }
 
+type bubbleRowLayout struct {
+	outgoing bool
+}
+
+func (l *bubbleRowLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	if len(objects) == 0 {
+		return fyne.NewSize(0, 0)
+	}
+	return objects[0].MinSize()
+}
+
+func (l *bubbleRowLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	if len(objects) == 0 {
+		return
+	}
+	bubble := objects[0]
+	bubbleSize := bubble.MinSize()
+	bubble.Resize(bubbleSize)
+
+	var x float32
+	if l.outgoing {
+		x = size.Width - bubbleSize.Width
+	} else {
+		x = 0
+	}
+	bubble.Move(fyne.NewPos(x, 0))
+}
+
+type fixedWidthLayout struct {
+	width float32
+}
+
+func (l *fixedWidthLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	if len(objects) == 0 {
+		return fyne.NewSize(0, 0)
+	}
+	min := objects[0].MinSize()
+	return fyne.NewSize(l.width, min.Height)
+}
+
+func (l *fixedWidthLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	if len(objects) == 0 {
+		return
+	}
+	child := objects[0]
+	child.Resize(fyne.NewSize(l.width, size.Height))
+	child.Move(fyne.NewPos(0, 0))
+}
+
+func measureTextWidth(text string) float32 {
+	if text == "" {
+		return 0
+	}
+	txt := canvas.NewText(text, color.Black)
+	txt.TextSize = theme.TextSize()
+	return txt.MinSize().Width
+}
+
 func main() {
 	application := app.NewWithID("dev.localcat.app")
 	window := application.NewWindow("LocalCat")
@@ -159,6 +217,18 @@ func main() {
 
 	updateConversationListUI := func() {}
 
+	getChatWidth := func() float32 {
+		w := chatScroll.Size().Width
+		if w > 0 {
+			return w
+		}
+		canvasW := window.Canvas().Size().Width
+		if canvasW > 0 {
+			return canvasW * 0.72 // splitView.Offset = 0.28
+		}
+		return 400
+	}
+
 	buildChatBubble := func(msg history.Message, senderName string) fyne.CanvasObject {
 		timeStr := msg.SentAt.Format("15:04")
 		displayTime := timeStr
@@ -166,37 +236,51 @@ func main() {
 			displayTime = timeStr + "  ✓✓"
 		}
 
+		chatWidth := getChatWidth()
+		maxWidth := chatWidth * 0.70
+		if maxWidth < 200 {
+			maxWidth = 200
+		}
+		if maxWidth > 600 {
+			maxWidth = 600
+		}
+		padding := theme.Padding() * 2
+		contentMaxWidth := maxWidth - padding
+		if contentMaxWidth < 0 {
+			contentMaxWidth = 0
+		}
+
+		naturalWidth := measureTextWidth(msg.Text)
+
+		var bodyWrapper fyne.CanvasObject
+		if naturalWidth <= contentMaxWidth {
+			bodyLabel := widget.NewLabel(msg.Text)
+			bodyLabel.Wrapping = fyne.TextWrapOff
+			bodyWrapper = bodyLabel
+		} else {
+			richText := widget.NewRichText(&widget.TextSegment{Text: msg.Text, Style: widget.RichTextStyle{}})
+			richText.Wrapping = fyne.TextWrapWord
+			richText.Resize(fyne.NewSize(contentMaxWidth, 0))
+			richText.Refresh()
+			bodyWrapper = container.New(&fixedWidthLayout{width: contentMaxWidth}, richText)
+		}
+
 		var textContent fyne.CanvasObject
 
 		if msg.Outgoing {
-			textCanvas := canvas.NewText(msg.Text, colorTextWhite)
-			textCanvas.TextSize = 14
-			timeCanvas := canvas.NewText(displayTime, colorTextWhite)
-			timeCanvas.TextSize = 11
-			timeCanvas.TextStyle = fyne.TextStyle{Italic: true}
-			textContent = container.NewVBox(textCanvas, timeCanvas)
+			timeLabel := widget.NewLabel(displayTime)
+			timeLabel.TextStyle = fyne.TextStyle{Italic: true}
+			textContent = container.NewVBox(bodyWrapper, timeLabel)
 		} else if senderName != "" {
-			userCanvas := canvas.NewText(senderName, colorTextDark)
-			userCanvas.TextSize = 14
-			userCanvas.TextStyle = fyne.TextStyle{Bold: true}
-
-			bodyCanvas := canvas.NewText(msg.Text, colorTextDark)
-			bodyCanvas.TextSize = 14
-
-			timeCanvas := canvas.NewText(displayTime, colorTextSub)
-			timeCanvas.TextSize = 11
-			timeCanvas.TextStyle = fyne.TextStyle{Italic: true}
-
-			textContent = container.NewVBox(userCanvas, bodyCanvas, timeCanvas)
+			userLabel := widget.NewLabel(senderName)
+			userLabel.TextStyle = fyne.TextStyle{Bold: true}
+			timeLabel := widget.NewLabel(displayTime)
+			timeLabel.TextStyle = fyne.TextStyle{Italic: true}
+			textContent = container.NewVBox(userLabel, bodyWrapper, timeLabel)
 		} else {
-			bodyCanvas := canvas.NewText(msg.Text, colorTextDark)
-			bodyCanvas.TextSize = 14
-
-			timeCanvas := canvas.NewText(displayTime, colorTextSub)
-			timeCanvas.TextSize = 11
-			timeCanvas.TextStyle = fyne.TextStyle{Italic: true}
-
-			textContent = container.NewVBox(bodyCanvas, timeCanvas)
+			timeLabel := widget.NewLabel(displayTime)
+			timeLabel.TextStyle = fyne.TextStyle{Italic: true}
+			textContent = container.NewVBox(bodyWrapper, timeLabel)
 		}
 
 		bubbleBg := canvas.NewRectangle(colorIncomingBg)
@@ -210,16 +294,7 @@ func main() {
 			container.NewPadded(textContent),
 		)
 
-		if msg.Outgoing {
-			return container.NewHBox(
-				layout.NewSpacer(),
-				bubble,
-			)
-		}
-		return container.NewHBox(
-			bubble,
-			layout.NewSpacer(),
-		)
+		return container.New(&bubbleRowLayout{outgoing: msg.Outgoing}, bubble)
 	}
 
 	renderConversation := func(convID string) {
@@ -439,8 +514,8 @@ func main() {
 			subtitleLabel := subtitleRow.Objects[1].(*widget.Label)
 
 			lastRow := vbox.Objects[2].(*fyne.Container)
-			lastMsgLabel := lastRow.Objects[1].(*widget.Label)
-			unreadBadge := lastRow.Objects[2].(*widget.Label)
+			lastMsgLabel := lastRow.Objects[0].(*widget.Label)
+			unreadBadge := lastRow.Objects[1].(*widget.Label)
 
 			if item.isGroup {
 				statusDot.FillColor = colorGroupBg
